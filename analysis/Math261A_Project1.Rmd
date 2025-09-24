@@ -1,0 +1,473 @@
+---
+title: "Best-Lap Deficit and Starting Grid: Two Simple Predictors of F1 Outcomes"
+author: "Suneel Chandra Vanamu"
+output:
+  pdf_document:
+    latex_engine: xelatex
+  word_document: default
+---
+
+### Project context
+
+This study uses the F1DB CSV release to explore several one- and two-predictor relationships impacting Formula 1 race outcomes. I will examine how starting grid position and best-lap pace deficit (the difference between a driver's best race lap and the race's fastest lap) may influence a driver's gap to the winner and final finishing position. To ensure comparability across tracks and years, I focus on races from the 2014–present V6 turbo-hybrid era and use gap-to-winner (in secs) as the uniform performance metric.
+
+### Research question
+
+-   Q1: Does a larger best-lap deficit (sec) correspond to a larger gap to the winner (sec)?
+-   Q2: Does starting farther back on the grid (higher grid number) predict a larger gap to the winner (sec)
+-   Q3: Does a larger best-lap deficit (sec) predict a worse finishing position?
+-   Q4: Do drivers starting farther back (higher grid number) tend to finish further back (higher finishing position)?
+
+## Data source and files
+
+I downloaded the CSV release from the **F1DB GitHub**. I’m using three files:
+
+-   `f1db-races.csv` (for race year and naming)
+-   `f1db-races-race-results.csv` (to get times and gaps)
+-   `f1db-races-fastest-laps.csv` (to get fastest lap times (best-lap pace))
+
+### Setup
+
+```{r}
+# Packages Required
+packages <- c("tidyverse","readr","janitor","broom","stringr","ggplot2")
+to_install <- setdiff(packages, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, quiet = TRUE)
+
+library(tidyverse); library(readr); library(janitor); library(broom); library(stringr); library(ggplot2)
+
+data_dir <- "/Users/spartan/Desktop/Math 261/Project 1/F1_Datasets_for_Project"
+
+# Quiet readr column-spec noise
+options(readr.show_col_types = FALSE)
+```
+
+### Loading the datset
+
+```{r}
+races <- suppressWarnings(read_csv(file.path(data_dir, "f1db-races.csv")) |> clean_names())
+res   <- suppressWarnings(read_csv(file.path(data_dir, "f1db-races-race-results.csv")) |> clean_names())
+fast <- suppressWarnings(read_csv(file.path(data_dir, "f1db-races-fastest-laps.csv")) |> clean_names())
+```
+
+```{r}
+head(races); str(races); summary(races)
+```
+
+```{r}
+head(res); str(res); summary(res)
+```
+
+```{r}
+head(fast); str(fast); summary(fast)
+```
+
+### Building the outcome: gap-to-winner (seconds), 2014+
+
+```{r}
+# Keep only the columns we need for results
+res_keep <- res |>
+  select(race_id, driver_id,
+         time_millis,            # finish time in ms
+         gap_text = gap,         # "+23.456s", "1:02.345", "+1 Lap"
+         gap_millis,             # numeric gap to leader in ms (if present)
+         grid_position_number,   # for Model 2 later
+         position_number)        # for Model 2 outcome
+```
+
+```{r}
+# Filtering the dataset on year from 2014 to present
+races_keep <- races |> transmute(race_id = id, year)
+res_era <- res_keep |> inner_join(races_keep, by = "race_id") |> filter(year >= 2014)
+```
+
+```{r}
+# Helper to parse "M:SS.sss" or "SS.sss" into seconds, ignore "+1 Lap"
+parse_gap_seconds <- function(x) {
+  y <- str_trim(x); y[is.na(y)] <- NA_character_
+  y[str_detect(y, regex("lap", ignore_case = TRUE))] <- NA_character_  # drop lap gaps
+  secs <- rep(NA_real_, length(y))
+  m <- str_match(y, "([0-9]+):([0-9]+\\.?[0-9]*)")
+  if (!all(is.na(m[,1]))) {
+    idx <- !is.na(m[,1]); secs[idx] <- as.numeric(m[idx,2])*60 + as.numeric(m[idx,3])
+  }
+  s <- str_match(y, "\\+?([0-9]+\\.?[0-9]*)s?$")
+  if (!all(is.na(s[,1]))) {
+    idx2 <- is.na(secs) & !is.na(s[,1]); secs[idx2] <- as.numeric(s[idx2,2])
+  }
+  secs
+}
+```
+
+```{r}
+# Build gap_sec with a clean fallback
+res_with_gap <- res_era |>
+  group_by(race_id) |>
+  mutate(winner_time = suppressWarnings(min(time_millis, na.rm = TRUE))) |>
+  ungroup() |>
+  mutate(
+    gap_sec_from_ms   = gap_millis/1000,
+    gap_sec_from_text = parse_gap_seconds(gap_text),
+    gap_sec_fallback  = if_else(is.finite(winner_time) & is.finite(time_millis),
+                                (time_millis - winner_time)/1000, NA_real_),
+    gap_sec = coalesce(gap_sec_from_ms, gap_sec_from_text, gap_sec_fallback)
+  ) |>
+  filter(is.finite(gap_sec)) |>
+  select(-winner_time, -gap_sec_from_ms, -gap_sec_from_text, -gap_sec_fallback)
+```
+
+We don’t model raw race time because tracks/eras differ. Instead, for each race we compute each driver’s **gap to the winner (seconds)**—use a numeric gap when available, otherwise parse the text gap, and if needed subtract the winner’s time. We filter to **2014+** so the timing context is consistent. This directly addresses the comparability concern.
+
+In code, we first `group_by(race_id)` and compute `winner_time` as the **minimum `time_millis`** within each race (the winner’s finish time). We then build **three candidate gap measures**: (1) `gap_sec_from_ms` converts an already-numeric gap (`gap_millis/1000`) to seconds; (2) `gap_sec_from_text` parses the text gap (e.g., “+23.456s” or “1:02.345”) into seconds while ignoring non-comparable strings like “+1 Lap”; and (3) `gap_sec_fallback` computes `(time_millis − winner_time)/1000` when both times are present (this yields **0** for the winner). `coalesce(...)` chooses the **first non-missing** candidate in that priority order (numeric → parsed → fallback). We then `filter(is.finite(gap_sec))` to drop rows that still lack a valid gap (e.g., retirements with no time and no gap) and `select(...)` away the helper columns so they don’t leak into later steps. The result is a tidy per-driver, per-race table with a single, comparable outcome: **`gap_sec`**
+
+## MODEL 1 — Best-lap pace deficit → Gap to winner
+
+### Build the predictor: best-lap deficit (sec)
+
+For each driver in each race we take their **best race lap** and subtract the **race’s fastest lap**. That gives a small, continuous number in seconds—usually tenths to a couple of seconds. Bigger values mean the driver’s best lap was further off the ultimate pace that day. This is a nice predictor because its scale already matches the outcome’s units (seconds), and it captures a core idea: slower pace → larger final gap
+
+```{r}
+# Parse fastest-lap times if needed
+parse_lap_seconds <- function(x) {
+  y <- str_trim(x); y[is.na(y)] <- NA_character_
+  secs <- rep(NA_real_, length(y))
+  m <- str_match(y, "([0-9]+):([0-9]+\\.?[0-9]*)")
+  if (!all(is.na(m[,1]))) {
+    idx <- !is.na(m[,1]); secs[idx] <- as.numeric(m[idx,2])*60 + as.numeric(m[idx,3])
+  }
+  s <- str_match(y, "^([0-9]+\\.?[0-9]*)s?$")
+  if (!all(is.na(s[,1]))) {
+    idx2 <- is.na(secs) & !is.na(s[,1]); secs[idx2] <- as.numeric(s[idx2,2])
+  }
+  secs
+}
+
+if (!"time_millis" %in% names(fast) && "time" %in% names(fast)) {
+  fast <- fast |> mutate(time_millis = parse_lap_seconds(time)*1000)
+}
+```
+
+```{r}
+# Driver best lap per race, and race fastest lap
+best_lap <- fast |>
+  group_by(race_id, driver_id) |>
+  summarise(best_lap_ms = min(time_millis, na.rm = TRUE), .groups = "drop") |>
+  filter(is.finite(best_lap_ms))
+
+race_fast <- best_lap |>
+  group_by(race_id) |>
+  summarise(race_fast_ms = min(best_lap_ms, na.rm = TRUE), .groups = "drop")
+```
+
+```{r}
+# Predictor: best-lap deficit to race fastest (sec)
+pace <- best_lap |>
+  left_join(race_fast, by = "race_id") |>
+  mutate(best_lap_delta_sec = (best_lap_ms - race_fast_ms)/1000) |>
+  select(race_id, driver_id, best_lap_delta_sec)
+```
+
+```{r}
+# Join with outcome
+df_pace <- res_with_gap |>
+  left_join(pace, by = c("race_id","driver_id")) |>
+  filter(is.finite(best_lap_delta_sec)) |>
+  distinct(race_id, driver_id, .keep_all = TRUE)
+```
+
+Here we turn fastest-lap strings into numbers and build a clean “pace deficit” predictor.\
+`parse_lap_seconds()` converts lap times like **“1:22.345”** or **“77.123s”** into seconds (non-matches become `NA`).\
+If the file lacks `time_millis`, we create it from the parsed seconds × 1000.\
+We then compute each driver’s **best lap** in a race (minimum `time_millis`) and the **race’s fastest lap**.\
+The predictor is **best_lap_delta_sec = (driver best − race fastest)/1000**, e.g., 78.10s − 77.50s = **0.60s**.\
+Finally, we join this predictor to the outcome table by `(race_id, driver_id)`, drop non-finite rows, and keep one row per driver-race so the modeling data is tidy.
+
+### Plotting the graph
+
+```{r}
+p_pace <- ggplot(df_pace, aes(best_lap_delta_sec, gap_sec)) +
+  geom_point(alpha = 0.35) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Gap to Winner vs Best-Lap Deficit — 2014+",
+       x = "Best-lap deficit to race fastest (sec)",
+       y = "Gap to winner (sec)")
+p_pace
+```
+
+The scatter plot shows a clear **positive trend**: as the **best-lap deficit** grows, the **gap to the winner** tends to grow. The points are noisy (race dynamics), but the **red regression line** rises steadily, which is what we’d expect: being slower on your best lap generally correlates with finishing further behind.
+
+### Fit the model + metrics & residuals
+
+```{r}
+mod_pace <- lm(gap_sec ~ best_lap_delta_sec, data = df_pace)
+summ_pace <- summary(mod_pace)
+```
+
+```{r}
+# Core metrics
+r2_pace    <- summ_pace$r.squared
+adjr2_pace <- summ_pace$adj.r.squared
+rse_pace   <- summ_pace$sigma                # residual standard error (sec)
+rse2_pace  <- rse_pace^2                     # squared standard error of regression (variance)
+
+# Coefficient SE^2 (variances)
+coef_var_pace <- diag(vcov(mod_pace)) |> tibble::enframe(name = "term", value = "coef_variance_se_sq")
+```
+
+```{r}
+# Residuals data
+aug_pace <- broom::augment(mod_pace)  # includes .fitted, .resid, .std.resid
+
+list(
+  r2 = r2_pace, adj_r2 = adjr2_pace,
+  rse_sec = rse_pace, rse_sq = rse2_pace
+)
+```
+
+```{r}
+head(aug_pace)
+head(coef_var_pace)
+```
+
+With this fit, **R² = 0.2385** and **Adj-R² = 0.2382**, so the best-lap deficit explains about **24%** of the variation in gap—solid for a one-predictor racing model. The **residual standard error is 26.26 s** (so **RSE² = 689.76 s²**), which means a typical miss is roughly **±26 seconds**; e.g., if the line predicts a 40-second gap, many results will land roughly **14–66 s** (rule-of-thumb, not a bound). You can see this in the residuals: the winner row has **fitted ≈ 18.39 s** vs **actual 0**, giving **residual −18.39 s** (winners compress gaps), while another row shows **fitted 24.68 s** vs **actual 26.78 s**, **residual +2.09 s** (close fit). The **coefficient variances (SE²)** are **0.826** for the intercept and **0.252** for the slope (SEs ≈ **0.91** and **0.50**), which means the line itself is estimated with decent precision—separate from the \~26 s scatter of individual data points.
+
+```{r}
+# Residuals vs Fitted
+p_resid_pace <- ggplot(aug_pace, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(title = "Residuals vs Fitted — Pace Model", x = "Fitted gap (sec)", y = "Residuals")
+
+p_resid_pace
+```
+
+This plot has the **shape we expected** given our variables. The **vertical “wall”** around a fitted value of \~**18 s**—that’s the model intercept (what the line predicts when best-lap deficit = 0). Because deficits can’t be negative, fitted values can’t go left of that wall. The **diagonal lower edge** is the constraint **residual ≥ −fitted** (gaps can’t be negative), so as fitted increases, the most negative residual you can see drops along that line. Inside those bounds the cloud is fairly even, with a **slight fan-out** (residual spread grows a bit as fitted gap grows), which is common in racing data. There’s no obvious curvature, so linearity looks reasonable for a simple one-X model. If we wanted to tame the boundary/fan-out, we’d report a **log1p(gap)** robustness check or repeat the fit after **excluding winners** (gap = 0); but for the main analysis this diagnostic is acceptable and interpretable
+
+## MODEL 2 — Starting grid position → Finishing position
+
+### Building the dataset
+
+```{r}
+df_gridpos <- res_era |>
+  select(race_id, driver_id,
+         grid_pos   = grid_position_number,
+         finish_pos = position_number) |>
+  filter(is.finite(grid_pos), is.finite(finish_pos)) |>
+  distinct(race_id, driver_id, .keep_all = TRUE)
+```
+
+Here we keep each driver’s **starting grid position** and **finishing position** from 2014+. Both are ranks (1 is best), which makes the direction easy to read: bigger grid numbers mean you started further back.
+
+### Plotting the graph
+
+```{r}
+p_gridpos <- ggplot(df_gridpos, aes(grid_pos, finish_pos)) +
+  geom_jitter(width = 0.2, height = 0.2, alpha = 0.35) +
+  geom_smooth(method = "lm", se = TRUE, color = "red") +
+  labs(title = "Finishing Position vs Starting Grid Position — 2014+",
+       x = "Starting grid position (1 = pole)",
+       y = "Finishing position (1 = winner)")
+p_gridpos
+```
+
+This figure shows a strong, clean pattern: the **red line slopes upward** across the grid. Drivers who start further back generally **finish further back**. The vertical stripes just reflect the discrete grid numbers.
+
+### Fit the model + metrics & residuals
+
+```{r}
+mod_gridpos <- lm(finish_pos ~ grid_pos, data = df_gridpos)
+summ_grid   <- summary(mod_gridpos)
+```
+
+```{r}
+# Core metrics
+r2_grid    <- summ_grid$r.squared
+adjr2_grid <- summ_grid$adj.r.squared
+rse_grid   <- summ_grid$sigma            # in "positions"
+rse2_grid  <- rse_grid^2
+
+# Coefficient variances (squared SEs)
+coef_var_grid <- diag(vcov(mod_gridpos)) |> tibble::enframe(name = "term", value = "coef_variance_se_sq")
+
+
+```
+
+```{r}
+# Residuals
+aug_grid <- broom::augment(mod_gridpos)
+
+list(
+  r2 = r2_grid, adj_r2 = adjr2_grid,
+  rse_positions = rse_grid, rse_sq = rse2_grid
+)
+```
+
+```{r}
+head(coef_var_grid)
+head(aug_grid)
+```
+
+With this fit, **R² = 0.5538** and **Adj-R² = 0.5537**, so starting position alone explains about **55%** of the variation in finishing position — strong for a one-predictor model. The **residual standard error is 3.415 positions** (so **RSE² ≈ 11.66**), meaning a typical miss is roughly **±3–3.5 places**; e.g., if the line predicts **P9**, many results will land around **P6–P12**. The **coefficient variances (SE²)** are tiny — **\~0.0116** for the intercept and **\~8.46×10⁻⁵** for the slope — indicating the fitted line is estimated very precisely. The residual examples match the story: a driver starting **P3** and finishing **P1** has **fitted ≈ 4.40** and **residual −3.40** (better than predicted), while **grid P15 → finish P5** shows **fitted ≈ 12.27**, **residual −7.27** (big overperformance). Overall, the model captures the general “start back → finish back” trend well, while leaving room for race-day upsets.
+
+```{r}
+p_resid_grid <- ggplot(aug_grid, aes(.fitted, .resid)) +
+  geom_point(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  labs(title = "Residuals vs Fitted — Grid→Finish", x = "Fitted finish pos", y = "Residuals")
+
+p_resid_grid
+```
+
+This plot looks as expected when both outcome and predictor are ranks. The **vertical stacks** come from fitted finishing positions taking near-integer values, so residuals pile up at each fitted bin. Residuals are **centered around 0** with a typical spread of about **±3–4 places** (matches the RSE ≈ **3.41**), and most points fall within roughly **±10**. There’s a **mild pattern**: at the **front** (fitted ≈ 3–6) residuals skew a bit **positive** (some drivers finish slightly worse than the line predicts), while at the **back** (fitted ≈ 12–16) residuals skew **negative** (some finish slightly better). That hints at **gentle curvature**—diminishing returns as you move deeper on the grid—rather than a big model miss. We don’t see a strong **funnel** (variance roughly stable), so the **linear one-X fit is acceptable**.
+
+## MODEL 3 — Starting grid position → Gap to winner
+
+### Building the dataset
+
+```{r}
+# Grid position → Gap to winner (sec)
+df_gridgap <- res_with_gap |>
+  dplyr::select(race_id, driver_id, year,
+                grid_pos = grid_position_number,
+                gap_sec) |>
+  dplyr::filter(is.finite(grid_pos), is.finite(gap_sec)) |>
+  dplyr::distinct(race_id, driver_id, .keep_all = TRUE)
+
+summary(df_gridgap$grid_pos); summary(df_gridgap$gap_sec)
+nrow(df_gridgap)
+
+```
+
+Here I keep each driver’s **starting grid position** and their **gap to the winner (seconds)**, one row per driver–race in the hybrid era. The predictor is an **ordinal rank** (1 = pole; higher = farther back) and the outcome is a **continuous time** in seconds, where 0 marks the winner. I drop rows with missing values so the analysis uses complete records only. This gives me a clean table to study whether **starting deeper on the grid** typically translates into a **larger time deficit** at the flag.
+
+### Plotting the Graph
+
+```{r}
+p_gridgap <- ggplot2::ggplot(df_gridgap, ggplot2::aes(grid_pos, gap_sec)) +
+  ggplot2::geom_jitter(width = 0.2, height = 0, alpha = 0.35) +
+  ggplot2::geom_smooth(method = "lm", se = TRUE, color = "red") +
+  ggplot2::labs(title = "Gap to Winner (sec) vs Starting Grid Position — 2014+",
+                x = "Starting grid position (1 = pole)",
+                y = "Gap to winner (seconds)")
+p_gridgap
+# ggplot2::ggsave("figs/scatter_gap_vs_grid.png", p_gridgap, width = 7, height = 5, dpi = 300)
+
+```
+
+The points form vertical **stripes** (discrete grid slots), and the **red line trends upward**: cars starting further back generally finish further behind the winner in seconds. The spread **widens** as grid position increases—late starters can either carve through the field or get stuck in traffic—so while the direction is clear, the variability also grows. A few large-gap outliers are expected (damage, penalties, retirements just before the end).
+
+### Fit the model + metrics & residuals
+
+```{r}
+mod_gridgap <- lm(gap_sec ~ grid_pos, data = df_gridgap)
+
+# Coefficients with 95% CI
+coef_gridgap <- broom::tidy(mod_gridgap, conf.int = TRUE)
+
+# Model-level metrics
+gl_gridgap <- broom::glance(mod_gridgap)
+rse_gridgap <- summary(mod_gridgap)$sigma   # residual standard error (sec)
+metrics_gridgap <- tibble::tibble(
+  n         = gl_gridgap$nobs,
+  r2        = gl_gridgap$r.squared,
+  adj_r2    = gl_gridgap$adj.r.squared,
+  rse_sec   = rse_gridgap,
+  rse_sq    = rse_gridgap^2
+)
+
+
+coef_gridgap
+metrics_gridgap
+
+```
+
+The slope is about **`r round(coef_gridgap$estimate[coef_gridgap$term=="grid_pos"], 3)` sec per grid place** (95% CI **[`r round(coef_gridgap$conf.low[coef_gridgap$term=="grid_pos"], 3)`, `r round(coef_gridgap$conf.high[coef_gridgap$term=="grid_pos"], 3)`]**), meaning each row farther back adds roughly that many seconds to the expected gap. The model explains **`r round(metrics_gridgap$r2, 3)`** of gap variation (adjusted R² = **`r round(metrics_gridgap$adj_r2, 3)`**), with a residual standard error of **`r round(metrics_gridgap$rse_sec, 2)` s** (variance **`r round(metrics_gridgap$rse_sq, 2)`**). In plain terms, if the line predicts a **25s** gap, actual results often land about **25s ± `r round(metrics_gridgap$rse_sec, 1)` s**. That’s a **moderate** one-number summary: starting position matters for final time, but race dynamics still move things around.
+
+```{r}
+aug_gridgap <- broom::augment(mod_gridgap)
+
+p_resid_gridgap <- ggplot2::ggplot(aug_gridgap, ggplot2::aes(.fitted, .resid)) +
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+  ggplot2::labs(title = "Residuals vs Fitted — Grid → Gap",
+                x = "Fitted gap (sec)", y = "Residuals")
+p_resid_gridgap
+```
+
+Residuals are **centered around zero** with **slightly larger spread** at bigger fitted gaps—reasonable for a time outcome influenced by traffic, strategies, and incidents. There’s no sharp **funnel** or strong curvature, so the linear mean effect looks **adequate** for a simple one-X model. If needed, robust standard errors would be a light-touch guardrail against the mild heteroskedasticity.
+
+## MODEL 4 — Best-lap deficit → Gap to winner
+
+### Building the dataset
+
+```{r}
+df_pace_pos <- df_pace |>
+  dplyr::left_join(
+    res |> dplyr::select(race_id, driver_id, finish_pos = position_number),
+    by = c("race_id","driver_id")
+  ) |>
+  dplyr::filter(is.finite(finish_pos)) |>
+  dplyr::distinct(race_id, driver_id, .keep_all = TRUE)
+
+summary(df_pace_pos$best_lap_delta_sec); summary(df_pace_pos$finish_pos); nrow(df_pace_pos)
+
+```
+
+This table links each driver’s **best-lap pace deficit** (seconds slower than the race’s fastest lap) to their **finishing position** (1 = winner), keeping one record per driver–race. I join the previously built pace data to results, drop missing values, and stick to the hybrid era for apples-to-apples comparisons. The setup asks a direct question: **does being slower on your best lap usually mean finishing further back?**
+
+### Plotting the graph
+
+```{r}
+p_pace_finish <- ggplot2::ggplot(df_pace_pos,
+                                 ggplot2::aes(best_lap_delta_sec, finish_pos)) +
+  ggplot2::geom_jitter(width = 0, height = 0.2, alpha = 0.35) +
+  ggplot2::geom_smooth(method = "lm", se = TRUE, color = "red") +
+  ggplot2::labs(title = "Finishing Position vs Best-Lap Deficit — 2014+",
+                x = "Best-lap deficit to race fastest (sec)",
+                y = "Finishing position (1 = winner)")
+p_pace_finish
+# ggplot2::ggsave("figs/scatter_finishpos_vs_bestlap_deficit.png", p_pace_finish, 7, 5, dpi = 300)
+
+```
+
+Even with jitter only a little vertical noise, the **red line slopes upward**—bigger **best-lap deficits** generally align with **worse finishing positions**. Near **zero deficit**, finishes skew toward the front but not guaranteed (traffic and strategy still bite). By a few seconds off the fastest lap, **front-running finishes are rare**, which fits intuition.
+
+### Fit the model + metrics & residuals
+
+```{r}
+mod_pace_pos <- lm(finish_pos ~ best_lap_delta_sec, data = df_pace_pos)
+
+# Coefficients with 95% CI
+coef_pace_pos <- broom::tidy(mod_pace_pos, conf.int = TRUE)
+
+# Model-level metrics
+gl_pace_pos  <- broom::glance(mod_pace_pos)
+rse_pace_pos <- summary(mod_pace_pos)$sigma  # residual standard error (in positions)
+
+metrics_pace_pos <- tibble::tibble(
+  n          = gl_pace_pos$nobs,
+  r2         = gl_pace_pos$r.squared,
+  adj_r2     = gl_pace_pos$adj.r.squared,
+  rse_pos    = rse_pace_pos,    # typical miss in positions
+  rse_sq     = rse_pace_pos^2   # squared standard error (residual variance)
+)
+
+coef_pace_pos
+metrics_pace_pos
+
+```
+
+The slope is about **`r round(coef_pace_pos$estimate[coef_pace_pos$term=="best_lap_delta_sec"], 3)` positions per +1s deficit** (95% CI **[`r round(coef_pace_pos$conf.low[coef_pace_pos$term=="best_lap_delta_sec"], 3)`, `r round(coef_pace_pos$conf.high[coef_pace_pos$term=="best_lap_delta_sec"], 3)`]**). The fit explains **`r round(metrics_pace_pos$r2, 3)`** of finishing-order variation (adjusted R² = **`r round(metrics_pace_pos$adj_r2, 3)`**). The residual standard error is **`r round(metrics_pace_pos$rse_pos, 2)` positions** (variance **`r round(metrics_pace_pos$rse_sq, 2)`**), so if the line predicts **P9**, results often land roughly **P9 ± `r round(metrics_pace_pos$rse_pos, 1)`**. It’s a **meaningful but noisier** signal than grid position, as expected.
+
+```{r}
+aug_pace_pos <- broom::augment(mod_pace_pos)
+
+p_resid_pace_pos <- ggplot2::ggplot(aug_pace_pos, ggplot2::aes(.fitted, .resid)) +
+  ggplot2::geom_point(alpha = 0.3) +
+  ggplot2::geom_hline(yintercept = 0, linetype = 2) +
+  ggplot2::labs(title = "Residuals vs Fitted — Best-Lap Deficit → Finish",
+                x = "Fitted finish position", y = "Residuals")
+p_resid_pace_pos
+```
+
+We see the typical **striping** from an integer outcome, with residuals **centered near zero**. There’s a **slight tilt**—the model can be a bit optimistic for the very front and a bit pessimistic for the very back—most likely from the **bounded rank scale** and mild nonlinearity. There’s no strong funnel, so the linear one-predictor fit is **acceptable.**
