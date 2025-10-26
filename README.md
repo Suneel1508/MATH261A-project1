@@ -86,12 +86,12 @@ MATH261A-project1/
    # output: Project_Report.pdf
    ```
 
-> If knitting from RStudio, just open `Math261A_Project_Report_v1.qmd` and click **Render**.
+> If knitting from RStudio, just open `Math261A_Project_Report_v3.qmd` and click **Render**.
 
 ## How to Run the Analysis (quick start)
 
 * Mention the path of F1DB CSVs in `data_dir in the .rmd or .qmd file`
-* Open `Math261A_Project_Report_v1.qmd`
+* Open `Math261A_Project_Report_v3.qmd`
 * Knit to PDF; the report:
 
   * Loads/cleans data (2014+)
