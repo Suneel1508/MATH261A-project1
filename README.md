@@ -41,13 +41,11 @@ MATH261A-project1/
 ├─ MATH261A-project1.Rproj 
 ├─ .gitignore
 
-├─ analysis/ 
-│ └─ Math261A_Project1.Rmd # R Markdown with code
-
 ├─ paper/ # Final paper assets
 │ ├─ Math261_Project_Report_v1.qmd # Main Quarto source for the paper
 │ ├─ references.bib # Bibliography used by the QMD
-│ └─ Math261_Project_Report_v1.pdf # Rendered PDF 
+│ └─ Math261_Project_Report_v1.pdf # Rendered PDF
+│ └─ ... (other versions of qmd's and pdf's)
 
 ├─ data/ # Data 
 │ ├─ F1db-csv/ # Full F1DB CSV release (raw, unchanged)
